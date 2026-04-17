@@ -6,7 +6,7 @@ use futures_lite::io::{AsyncRead, AsyncWrite};
 use crate::sys;
 
 #[allow(unused)]
-pub(crate) const PIPE_CAPACITY: usize = 0x100000; // 1Mb
+pub(crate) const PIPE_CAPACITY: usize = 0x8000; // 32KB — limits blast radius on partial-write drops, faster backpressure signal
 
 macro_rules! derive_async_read {
     ($type:ty, $field:tt) => {

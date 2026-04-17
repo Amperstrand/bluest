@@ -220,6 +220,7 @@ impl InputStreamDelegate {
 
 struct OutputStreamDelegateIvars {
     receiver: Mutex<BlockOn<piper::Reader>>,
+    pending: Mutex<Vec<u8>>,
     stream: Dispatched<NSOutputStream>,
 }
 
@@ -252,6 +253,7 @@ impl OutputStreamDelegate {
     pub fn new(receiver: piper::Reader, stream: Dispatched<NSOutputStream>) -> Retained<Self> {
         let ivars = OutputStreamDelegateIvars {
             receiver: Mutex::new(BlockOn::new(receiver)),
+            pending: Mutex::new(Vec::new()),
             stream,
         };
         let this = OutputStreamDelegate::alloc().set_ivars(ivars);
@@ -260,32 +262,73 @@ impl OutputStreamDelegate {
 
     fn send_packet(&self, output_stream: &NSOutputStream) {
         let mut receiver = self.ivars().receiver.lock().unwrap();
+        let mut pending = self.ivars().pending.lock().unwrap();
 
-        // This is racy but there will always be at least this many bytesin the channel
-        let to_write = receiver.get_ref().len();
-        if to_write == 0 {
-            trace!("No data to write");
-            return;
-        }
-        let mut buf = vec![0u8; to_write];
-        let to_write = match receiver.read(&mut buf) {
-            Err(e) => {
-                warn!("Error reading from stream {:?}", e);
-                return;
-            }
-            Ok(0) => {
-                trace!("No more data to write");
+        while !pending.is_empty() {
+            let res =
+                unsafe { output_stream.write_maxLength(NonNull::new_unchecked(pending.as_mut_ptr()), pending.len()) };
+            if res < 0 {
+                debug!(
+                    "Write Loop Error: Stream write failed (pending, {} bytes)",
+                    pending.len()
+                );
+                drop(pending);
+                drop(receiver);
                 self.close(output_stream);
                 return;
             }
-            Ok(n) => n,
-        };
+            if res == 0 {
+                trace!("Stream at capacity, {} bytes pending", pending.len());
+                return;
+            }
+            let written = res as usize;
+            trace!("Wrote {}/{} pending bytes", written, pending.len());
+            pending.drain(..written);
+        }
 
-        buf.truncate(to_write);
-        let res = unsafe { output_stream.write_maxLength(NonNull::new_unchecked(buf.as_mut_ptr()), buf.len()) };
-        if res < 0 {
-            debug!("Write Loop Error: Stream write failed");
-            self.close(output_stream);
+        loop {
+            let to_write = receiver.get_ref().len();
+            if to_write == 0 {
+                return;
+            }
+            let mut buf = vec![0u8; to_write];
+            let n = match receiver.read(&mut buf) {
+                Err(e) => {
+                    warn!("Error reading from pipe: {:?}", e);
+                    return;
+                }
+                Ok(0) => {
+                    trace!("Pipe closed");
+                    drop(pending);
+                    drop(receiver);
+                    self.close(output_stream);
+                    return;
+                }
+                Ok(n) => n,
+            };
+            buf.truncate(n);
+
+            let mut offset = 0;
+            while offset < buf.len() {
+                let res = unsafe {
+                    output_stream
+                        .write_maxLength(NonNull::new_unchecked(buf.as_mut_ptr().add(offset)), buf.len() - offset)
+                };
+                if res < 0 {
+                    debug!("Write Loop Error: Stream write failed (new data, offset={})", offset);
+                    drop(pending);
+                    drop(receiver);
+                    self.close(output_stream);
+                    return;
+                }
+                if res == 0 {
+                    pending.extend_from_slice(&buf[offset..]);
+                    trace!("Stream at capacity, {} bytes stored in pending", pending.len());
+                    return;
+                }
+                offset += res as usize;
+            }
+            trace!("Wrote {} bytes to stream, checking for more", buf.len());
         }
     }
 
