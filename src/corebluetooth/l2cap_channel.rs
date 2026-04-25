@@ -1,8 +1,11 @@
 use core::ptr::NonNull;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering::*};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::{fmt, pin};
+use std::time::Duration;
+use std::{fmt, pin, thread};
 
 use futures_lite::io::{AsyncRead, AsyncWrite, BlockOn};
 use objc2::rc::Retained;
@@ -10,15 +13,48 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass};
 use objc2_core_bluetooth::CBL2CAPChannel;
 use objc2_foundation::{
-    NSDefaultRunLoopMode, NSInputStream, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol,
+    NSDate, NSDefaultRunLoopMode, NSInputStream, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol,
     NSOutputStream, NSRunLoop, NSStream, NSStreamDelegate, NSStreamEvent, NSString,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::dispatch::Dispatched;
 use crate::l2cap_channel::{derive_async_read, derive_async_write, PIPE_CAPACITY};
 
-/// Utility struct to close the channel on drop.
+fn ble_runloop() -> &'static NSRunLoop {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    static READY: AtomicBool = AtomicBool::new(false);
+    if READY.load(Acquire) {
+        trace!("ble_runloop: returning cached runloop");
+        unsafe { return &*(*PTR.get().unwrap() as *const NSRunLoop) }
+    }
+    thread::Builder::new()
+        .name("bluest-l2cap-rl".into())
+        .spawn(|| unsafe {
+            let rl = NSRunLoop::currentRunLoop();
+            let _ = PTR.set(&*rl as *const NSRunLoop as usize);
+            READY.store(true, Release);
+            loop {
+                let mode = NSDefaultRunLoopMode;
+                let date = NSDate::dateWithTimeIntervalSinceNow(999999.0);
+                if !rl.runMode_beforeDate(&mode, &date) {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        })
+        .expect("ble_runloop thread spawn failed");
+    let mut waited = 0u64;
+    while !READY.load(Acquire) {
+        thread::sleep(Duration::from_millis(1));
+        waited += 1;
+        if waited > 5000 {
+            panic!("ble_runloop: timed out waiting for READY after 5s");
+        }
+    }
+    debug!("ble_runloop: ready after {waited}ms");
+    unsafe { &*(*PTR.get().unwrap() as *const NSRunLoop) }
+}
+
 pub(super) struct L2capCloser {
     channel: Dispatched<CBL2CAPChannel>,
 }
@@ -56,7 +92,6 @@ impl L2capChannel {
 derive_async_read!(L2capChannel, reader);
 derive_async_write!(L2capChannel, writer);
 
-/// The reader side of an L2CAP channel.
 pub struct L2capChannelReader {
     stream: piper::Reader,
     _closer: Arc<L2capCloser>,
@@ -64,7 +99,6 @@ pub struct L2capChannelReader {
 }
 
 impl L2capChannelReader {
-    /// Creates a new L2capChannelReader.
     pub(crate) fn new(channel: Dispatched<CBL2CAPChannel>) -> Self {
         let (read_rx, read_tx) = piper::pipe(PIPE_CAPACITY);
         let closer = Arc::new(L2capCloser {
@@ -75,7 +109,8 @@ impl L2capChannelReader {
             let input_stream = channel.inputStream().unwrap();
             let delegate = InputStreamDelegate::new(read_tx);
             input_stream.setDelegate(Some(&ProtocolObject::from_retained(delegate.clone())));
-            input_stream.scheduleInRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSDefaultRunLoopMode);
+            let rl = ble_runloop();
+            input_stream.scheduleInRunLoop_forMode(rl, NSDefaultRunLoopMode);
             input_stream.open();
             delegate
         });
@@ -96,7 +131,6 @@ impl fmt::Debug for L2capChannelReader {
     }
 }
 
-/// The writer side of an L2CAP channel.
 pub struct L2capChannelWriter {
     stream: piper::Writer,
     closer: Arc<L2capCloser>,
@@ -104,7 +138,6 @@ pub struct L2capChannelWriter {
 }
 
 impl L2capChannelWriter {
-    /// Creates a new L2capChannelWriter.
     pub(crate) fn new(channel: Dispatched<CBL2CAPChannel>) -> Self {
         let (write_rx, write_tx) = piper::pipe(PIPE_CAPACITY);
         let closer = Arc::new(L2capCloser {
@@ -115,7 +148,8 @@ impl L2capChannelWriter {
             let output_stream = channel.outputStream().unwrap();
             let delegate = OutputStreamDelegate::new(write_rx, Dispatched::retain(&output_stream));
             output_stream.setDelegate(Some(&ProtocolObject::from_retained(delegate.clone())));
-            output_stream.scheduleInRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSDefaultRunLoopMode);
+            let rl = ble_runloop();
+            output_stream.scheduleInRunLoop_forMode(rl, NSDefaultRunLoopMode);
             output_stream.open();
 
             let center = NSNotificationCenter::defaultCenter();
@@ -185,9 +219,7 @@ define_class!(
         fn handle_event(&self, stream: &NSStream, event_code: NSStreamEvent) {
             let input_stream = stream.downcast_ref::<NSInputStream>().unwrap();
             if let NSStreamEvent::HasBytesAvailable = event_code {
-                // This is the only writer task, so there should never be contention on this lock
                 let mut writer = self.ivars().writer.try_lock().unwrap();
-                // This is the the only task that writes to the pipe so at least this many bytes will be available
                 let to_fill = writer.get_ref().capacity() - writer.get_ref().len();
                 let mut buf = vec![0u8; to_fill].into_boxed_slice();
                 let res = unsafe { input_stream.read_maxLength(NonNull::new_unchecked(buf.as_mut_ptr()), buf.len()) };
@@ -220,7 +252,6 @@ impl InputStreamDelegate {
 
 struct OutputStreamDelegateIvars {
     receiver: Mutex<BlockOn<piper::Reader>>,
-    pending: Mutex<Vec<u8>>,
     stream: Dispatched<NSOutputStream>,
 }
 
@@ -253,7 +284,6 @@ impl OutputStreamDelegate {
     pub fn new(receiver: piper::Reader, stream: Dispatched<NSOutputStream>) -> Retained<Self> {
         let ivars = OutputStreamDelegateIvars {
             receiver: Mutex::new(BlockOn::new(receiver)),
-            pending: Mutex::new(Vec::new()),
             stream,
         };
         let this = OutputStreamDelegate::alloc().set_ivars(ivars);
@@ -262,73 +292,31 @@ impl OutputStreamDelegate {
 
     fn send_packet(&self, output_stream: &NSOutputStream) {
         let mut receiver = self.ivars().receiver.lock().unwrap();
-        let mut pending = self.ivars().pending.lock().unwrap();
 
-        while !pending.is_empty() {
-            let res =
-                unsafe { output_stream.write_maxLength(NonNull::new_unchecked(pending.as_mut_ptr()), pending.len()) };
-            if res < 0 {
-                debug!(
-                    "Write Loop Error: Stream write failed (pending, {} bytes)",
-                    pending.len()
-                );
-                drop(pending);
-                drop(receiver);
+        let to_write = receiver.get_ref().len();
+        if to_write == 0 {
+            trace!("No data to write");
+            return;
+        }
+        let mut buf = vec![0u8; to_write];
+        let to_write = match receiver.read(&mut buf) {
+            Err(e) => {
+                warn!("Error reading from stream {:?}", e);
+                return;
+            }
+            Ok(0) => {
+                trace!("No more data to write");
                 self.close(output_stream);
                 return;
             }
-            if res == 0 {
-                trace!("Stream at capacity, {} bytes pending", pending.len());
-                return;
-            }
-            let written = res as usize;
-            trace!("Wrote {}/{} pending bytes", written, pending.len());
-            pending.drain(..written);
-        }
+            Ok(n) => n,
+        };
 
-        loop {
-            let to_write = receiver.get_ref().len();
-            if to_write == 0 {
-                return;
-            }
-            let mut buf = vec![0u8; to_write];
-            let n = match receiver.read(&mut buf) {
-                Err(e) => {
-                    warn!("Error reading from pipe: {:?}", e);
-                    return;
-                }
-                Ok(0) => {
-                    trace!("Pipe closed");
-                    drop(pending);
-                    drop(receiver);
-                    self.close(output_stream);
-                    return;
-                }
-                Ok(n) => n,
-            };
-            buf.truncate(n);
-
-            let mut offset = 0;
-            while offset < buf.len() {
-                let res = unsafe {
-                    output_stream
-                        .write_maxLength(NonNull::new_unchecked(buf.as_mut_ptr().add(offset)), buf.len() - offset)
-                };
-                if res < 0 {
-                    debug!("Write Loop Error: Stream write failed (new data, offset={})", offset);
-                    drop(pending);
-                    drop(receiver);
-                    self.close(output_stream);
-                    return;
-                }
-                if res == 0 {
-                    pending.extend_from_slice(&buf[offset..]);
-                    trace!("Stream at capacity, {} bytes stored in pending", pending.len());
-                    return;
-                }
-                offset += res as usize;
-            }
-            trace!("Wrote {} bytes to stream, checking for more", buf.len());
+        buf.truncate(to_write);
+        let res = unsafe { output_stream.write_maxLength(NonNull::new_unchecked(buf.as_mut_ptr()), buf.len()) };
+        if res < 0 {
+            debug!("Write Loop Error: Stream write failed");
+            self.close(output_stream);
         }
     }
 
