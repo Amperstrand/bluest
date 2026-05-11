@@ -239,7 +239,11 @@ define_class!(
                 self.send_packet(output_stream)
             }
         }
+    }
 
+    // NSNotificationCenter handler — not part of NSStreamDelegate protocol.
+    // objc2's define_class! rejects non-protocol methods inside protocol impl blocks.
+    impl OutputStreamDelegate {
         #[unsafe(method(onNotified:))]
         fn on_notified(&self, _n: &NSNotification) {
             let stream = unsafe { self.ivars().stream.get() };
